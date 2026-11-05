@@ -1,0 +1,15 @@
+{
+  "name": "fintrack",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FinTrack monorepo helper scripts (each package has its own package.json)",
+  "scripts": {
+    "install:all": "npm install --prefix gateway && npm install --prefix services/auth-service && npm install --prefix services/transaction-service && npm install --prefix services/notification-service && npm install --prefix frontend",
+    "lint": "npm run lint --prefix gateway && npm run lint --prefix services/auth-service && npm run lint --prefix services/transaction-service && npm run lint --prefix services/notification-service && npm run lint --prefix frontend",
+    "test": "npm test --prefix gateway && npm test --prefix services/auth-service && npm test --prefix services/transaction-service && npm test --prefix services/notification-service",
+    "seed": "node scripts/seed.js",
+    "up": "docker compose up --build",
+    "down": "docker compose down"
+  },
+  "engines": { "node": ">=20" }
+}

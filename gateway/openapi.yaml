@@ -1,0 +1,416 @@
+openapi: 3.0.3
+info:
+  title: FinTrack API
+  version: 1.0.0
+  description: |
+    Public API of FinTrack, exposed only through the API gateway.
+    All protected endpoints need `Authorization: Bearer <accessToken>`.
+    The refresh token travels in an HttpOnly cookie named `refreshToken` (path `/api/auth`).
+    Money amounts are in INR (rupees, max 2 decimals). Dates are `YYYY-MM-DD`, months are `YYYY-MM`.
+servers:
+  - url: /
+tags:
+  - name: Health
+  - name: Auth
+  - name: Transactions
+  - name: Notifications
+  - name: Settings
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Gateway health
+      responses:
+        '200':
+          description: Gateway is up
+          content:
+            application/json:
+              example: { success: true, service: gateway, status: ok }
+  /health/services:
+    get:
+      tags: [Health]
+      summary: Health of all downstream services
+      responses:
+        '200': { description: All services healthy }
+        '503': { description: At least one service is unreachable }
+  /api/auth/register:
+    post:
+      tags: [Auth]
+      summary: Create an account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+            example: { name: Asha Verma, email: asha@example.com, password: Passw0rdOK }
+      responses:
+        '201':
+          description: Account created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { description: Email already registered, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      description: Returns a short-lived access token and sets the `refreshToken` HttpOnly cookie. Failed attempts are rate limited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+            example: { email: asha@example.com, password: Passw0rdOK }
+      responses:
+        '200':
+          description: Logged in
+          headers:
+            Set-Cookie: { schema: { type: string }, description: 'refreshToken=...; HttpOnly; Path=/api/auth' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '401': { description: Incorrect email or password, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '429': { description: Too many failed attempts, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate the refresh token and get a new access token
+      description: Reads the `refreshToken` cookie. Each refresh token is single use; reusing an old one revokes the session.
+      responses:
+        '200':
+          description: New access token and rotated cookie
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '401': { description: Missing, invalid, expired or reused refresh token, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the refresh token and clear the cookie
+      responses:
+        '200': { description: Logged out }
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/transactions:
+    get:
+      tags: [Transactions]
+      summary: List transactions (filter, search, sort, paginate)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: month, in: query, schema: { type: string, example: '2026-11' } }
+        - { name: type, in: query, schema: { type: string, enum: [income, expense] } }
+        - { name: category, in: query, schema: { type: string, example: Food } }
+        - { name: q, in: query, description: Search in notes, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer, default: 1, minimum: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 10, minimum: 1, maximum: 100 } }
+        - { name: sort, in: query, schema: { type: string, default: '-date', enum: [date, '-date', amount, '-amount', createdAt, '-createdAt'] } }
+      responses:
+        '200':
+          description: A page of transactions
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionList' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Transactions]
+      summary: Create a transaction
+      description: Creating an expense publishes an `expense.created` event to RabbitMQ (asynchronously).
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransactionInput' }
+            example: { amount: 12000, type: expense, category: Rent, date: '2026-11-04', note: November rent }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/transactions/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Transactions]
+      summary: Get one transaction
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The transaction
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Transactions]
+      summary: Update a transaction
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransactionInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Transactions]
+      summary: Delete a transaction
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/transactions/summary:
+    get:
+      tags: [Transactions]
+      summary: Monthly summary
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: month, in: query, required: true, schema: { type: string, example: '2026-11' } }
+      responses:
+        '200':
+          description: Totals, balance and category-wise expense breakdown
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SummaryResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+  /api/transactions/trend:
+    get:
+      tags: [Transactions]
+      summary: Income and expense per month for the last N months
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: months, in: query, schema: { type: integer, default: 6, minimum: 1, maximum: 24 } }
+        - { name: to, in: query, description: Last month to include, schema: { type: string, example: '2026-11' } }
+      responses:
+        '200': { description: Monthly series }
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: Notification history
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: unread, in: query, schema: { type: string, enum: ['true', 'false'] } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 20 } }
+      responses:
+        '200':
+          description: Notifications plus the unread count
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationList' }
+  /api/notifications/{id}/read:
+    patch:
+      tags: [Notifications]
+      summary: Mark a notification as read
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Marked as read }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/notifications/read-all:
+    patch:
+      tags: [Notifications]
+      summary: Mark all notifications as read
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Number of notifications updated }
+  /api/settings/threshold:
+    get:
+      tags: [Settings]
+      summary: Get the expense alert threshold
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Current threshold (default until the user sets one)
+          content:
+            application/json:
+              example: { success: true, data: { threshold: 10000, isDefault: true } }
+    put:
+      tags: [Settings]
+      summary: Set the expense alert threshold
+      description: A notification is created when a single expense is strictly greater than this value.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [threshold]
+              properties: { threshold: { type: number, example: 10000 } }
+      responses:
+        '200': { description: Threshold saved }
+        '400': { $ref: '#/components/responses/ValidationError' }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  responses:
+    ValidationError:
+      description: Input validation failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            message: Validation failed
+            error: { code: VALIDATION_ERROR, details: [{ field: amount, message: Amount must be greater than 0 }] }
+            requestId: 6f1c2a1e-3c1c-4b0a-9a53-0d6f2f6b8f11
+    Unauthorized:
+      description: Missing, invalid or expired access token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found (also returned for other users' resources)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        message: { type: string }
+        error:
+          type: object
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            details: { type: array, items: { type: object } }
+        requestId: { type: string }
+    RegisterRequest:
+      type: object
+      required: [name, email, password]
+      properties:
+        name: { type: string, minLength: 2, maxLength: 60 }
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8, description: At least one letter and one number }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        email: { type: string }
+        createdAt: { type: string, format: date-time }
+    UserResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        data: { type: object, properties: { user: { $ref: '#/components/schemas/User' } } }
+    LoginResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            user: { $ref: '#/components/schemas/User' }
+            accessToken: { type: string }
+            tokenType: { type: string, example: Bearer }
+    TransactionInput:
+      type: object
+      required: [amount, type, category, date]
+      properties:
+        amount: { type: number, minimum: 0.01, example: 1500.5 }
+        type: { type: string, enum: [income, expense] }
+        category:
+          type: string
+          description: |
+            income: Salary, Freelance, Investments, Other.
+            expense: Food, Rent, Transport, Shopping, Bills, Health, Entertainment, Other.
+        date: { type: string, example: '2026-11-04' }
+        note: { type: string, maxLength: 200 }
+    Transaction:
+      allOf:
+        - { $ref: '#/components/schemas/TransactionInput' }
+        - type: object
+          properties:
+            id: { type: string }
+            createdAt: { type: string, format: date-time }
+            updatedAt: { type: string, format: date-time }
+    TransactionResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        data: { type: object, properties: { transaction: { $ref: '#/components/schemas/Transaction' } } }
+    TransactionList:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/Transaction' } }
+            page: { type: integer }
+            limit: { type: integer }
+            total: { type: integer }
+            totalPages: { type: integer }
+    SummaryResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            month: { type: string }
+            totalIncome: { type: number }
+            totalExpense: { type: number }
+            balance: { type: number }
+            transactionCount: { type: integer }
+            byCategory:
+              type: array
+              description: Expense breakdown by category
+              items:
+                type: object
+                properties:
+                  category: { type: string }
+                  total: { type: number }
+                  count: { type: integer }
+                  percentage: { type: number }
+    NotificationList:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string }
+                  message: { type: string }
+                  amount: { type: number }
+                  category: { type: string }
+                  read: { type: boolean }
+                  createdAt: { type: string, format: date-time }
+            unreadCount: { type: integer }
+            total: { type: integer }

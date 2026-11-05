@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { -webkit-text-size-adjust: 100%; }
+  body { @apply bg-slate-50 font-sans text-navy-900 antialiased; font-feature-settings: 'tnum' 1, 'cv11' 1; }
+  :focus-visible { @apply outline-2 outline-offset-2 outline-brand-600; }
+}
+
+@layer components {
+  .card { @apply rounded-2xl border border-slate-200/80 bg-white shadow-card; }
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-60; }
+  .btn-primary { @apply btn bg-brand-600 text-white hover:bg-brand-700; }
+  .btn-secondary { @apply btn border border-slate-200 bg-white text-navy-800 hover:bg-slate-50; }
+  .btn-danger { @apply btn bg-expense text-white hover:bg-rose-700; }
+  .btn-ghost { @apply btn text-navy-600 hover:bg-slate-100; }
+  .input { @apply w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-navy-900 placeholder:text-navy-400 focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-200; }
+  .input-error { @apply border-expense focus:border-expense focus:ring-rose-200; }
+  .label { @apply mb-1.5 block text-sm font-semibold text-navy-800; }
+  .field-error { @apply mt-1.5 text-sm text-expense; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

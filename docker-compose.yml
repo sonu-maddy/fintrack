@@ -1,0 +1,136 @@
+# Local development stack: docker compose up --build
+# Nothing here needs a cloud account. Secrets below are LOCAL defaults only; override them in .env.
+name: fintrack
+
+x-node-env: &node-env
+  NODE_ENV: production
+  INTERNAL_TOKEN: ${INTERNAL_TOKEN:-local-internal-token-change-me-0123456789abcdef}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-fintrack}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-fintrack_local_pw}
+    ports:
+      - "15672:15672" # management UI, login with the user/password above
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  auth-service:
+    build: ./services/auth-service
+    restart: unless-stopped
+    environment:
+      <<: *node-env
+      PORT: 4001
+      MONGO_URI: mongodb://mongo:27017/fintrack_users
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-local-access-secret-change-me-0123456789abcdef}
+      ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-15m}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-7}
+      COOKIE_SECURE: "false" # plain http locally; true in production
+      COOKIE_SAMESITE: lax
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  transaction-service:
+    build: ./services/transaction-service
+    restart: unless-stopped
+    environment:
+      <<: *node-env
+      PORT: 4002
+      MONGO_URI: mongodb://mongo:27017/fintrack_transactions
+      AMQP_URL: amqp://${RABBITMQ_USER:-fintrack}:${RABBITMQ_PASSWORD:-fintrack_local_pw}@rabbitmq:5672
+    depends_on:
+      mongo:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  notification-service:
+    build: ./services/notification-service
+    restart: unless-stopped
+    environment:
+      <<: *node-env
+      PORT: 4003
+      MONGO_URI: mongodb://mongo:27017/fintrack_notifications
+      AMQP_URL: amqp://${RABBITMQ_USER:-fintrack}:${RABBITMQ_PASSWORD:-fintrack_local_pw}@rabbitmq:5672
+      DEFAULT_THRESHOLD: ${DEFAULT_THRESHOLD:-10000}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  gateway:
+    build: ./gateway
+    restart: unless-stopped
+    environment:
+      <<: *node-env
+      PORT: 8080
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-local-access-secret-change-me-0123456789abcdef}
+      AUTH_SERVICE_URL: http://auth-service:4001
+      TRANSACTION_SERVICE_URL: http://transaction-service:4002
+      NOTIFICATION_SERVICE_URL: http://notification-service:4003
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
+    ports:
+      - "8080:8080"
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      transaction-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      GATEWAY_URL: http://gateway:8080
+    ports:
+      - "3000:80"
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # One-off job: docker compose --profile seed run --rm seed
+  seed:
+    image: node:20-alpine
+    profiles: ["seed"]
+    working_dir: /app
+    volumes:
+      - ./scripts:/app:ro
+    environment:
+      API_URL: http://gateway:8080
+      DEMO_EMAIL: ${DEMO_EMAIL:-demo@fintrack.local}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-Demo1234pass}
+      DEMO_NAME: ${DEMO_NAME:-Demo User}
+    command: ["node", "seed.js"]
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
+  rabbitmq_data:

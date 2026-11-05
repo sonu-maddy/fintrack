@@ -1,0 +1,15 @@
+const config = require('./config');
+const logger = require('./config/logger');
+
+config.validate();
+const app = require('./app');
+
+const server = app.listen(config.port, () => logger.info({ port: config.port }, 'gateway listening'));
+
+const shutdown = (signal) => {
+  logger.info({ signal }, 'Shutting down');
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10000).unref();
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

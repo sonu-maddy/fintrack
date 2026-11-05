@@ -1,0 +1,186 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stages 1-3: install, lint, test (one matrix job per package, run in parallel)
+  # ---------------------------------------------------------------------------
+  lint-test:
+    name: Lint and test (${{ matrix.path }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        path:
+          - gateway
+          - services/auth-service
+          - services/transaction-service
+          - services/notification-service
+          - frontend
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.path }}/package*.json
+
+      # mongodb-memory-server downloads a MongoDB binary the first time; cache it.
+      - name: Cache MongoDB binary for tests
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongodb-binaries-${{ runner.os }}-v1
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test --if-present
+
+      - name: Build frontend
+        if: matrix.path == 'frontend'
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Stages 4-5: build Docker images (every run), push to GHCR (only on main)
+  # ---------------------------------------------------------------------------
+  build-push:
+    name: Docker image (${{ matrix.name }})
+    needs: lint-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { name: gateway, context: gateway }
+          - { name: auth-service, context: services/auth-service }
+          - { name: transaction-service, context: services/transaction-service }
+          - { name: notification-service, context: services/notification-service }
+          - { name: frontend, context: frontend }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Image names must be lowercase.
+      - name: Compute image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/fintrack-${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ github.sha }}
+            ${{ steps.img.outputs.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # ---------------------------------------------------------------------------
+  # Stage 6: deploy (only on push to main, after tests and image push succeeded)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    needs: build-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      RENDER_DEPLOY_HOOK_AUTH: ${{ secrets.RENDER_DEPLOY_HOOK_AUTH }}
+      RENDER_DEPLOY_HOOK_TRANSACTION: ${{ secrets.RENDER_DEPLOY_HOOK_TRANSACTION }}
+      RENDER_DEPLOY_HOOK_NOTIFICATION: ${{ secrets.RENDER_DEPLOY_HOOK_NOTIFICATION }}
+      RENDER_DEPLOY_HOOK_GATEWAY: ${{ secrets.RENDER_DEPLOY_HOOK_GATEWAY }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      GATEWAY_URL: ${{ vars.GATEWAY_URL }}
+      FRONTEND_URL: ${{ vars.FRONTEND_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Render pulls ghcr.io/<owner>/fintrack-<name>:latest when its deploy hook is called.
+      # Services first, gateway last, so the gateway never points at a missing service.
+      - name: Trigger Render deploy hooks
+        run: |
+          set -euo pipefail
+          trigger() {
+            name="$1"; hook="$2"
+            if [ -z "$hook" ]; then
+              echo "::error::Missing secret for $name deploy hook"; return 1
+            fi
+            curl -fsS -X POST "$hook" > /dev/null
+            echo "Triggered deploy: $name"
+          }
+          trigger auth-service         "$RENDER_DEPLOY_HOOK_AUTH"
+          trigger transaction-service  "$RENDER_DEPLOY_HOOK_TRANSACTION"
+          trigger notification-service "$RENDER_DEPLOY_HOOK_NOTIFICATION"
+          trigger gateway              "$RENDER_DEPLOY_HOOK_GATEWAY"
+
+      # Optional: only runs when VERCEL_TOKEN is set. If you use Vercel's GitHub integration
+      # (it deploys on every push to main by itself), leave the Vercel secrets unset.
+      - name: Deploy frontend to Vercel
+        if: env.VERCEL_TOKEN != ''
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          npx --yes vercel@latest pull --yes --environment=production --token="$VERCEL_TOKEN"
+          npx --yes vercel@latest build --prod --token="$VERCEL_TOKEN"
+          npx --yes vercel@latest deploy --prebuilt --prod --token="$VERCEL_TOKEN"
+
+      # Render free services can take several minutes to pull the image and wake up, so retry for ~10 min.
+      - name: Verify deployed health endpoints
+        run: |
+          set -euo pipefail
+          if [ -z "$GATEWAY_URL" ]; then
+            echo "::error::Set the repository variable GATEWAY_URL (Settings > Secrets and variables > Actions > Variables)"; exit 1
+          fi
+          GATEWAY_URL="${GATEWAY_URL%/}"
+          check() {
+            url="$1"
+            for i in $(seq 1 30); do
+              if curl -fsS --max-time 30 "$url" > /dev/null; then echo "OK: $url"; return 0; fi
+              echo "Waiting for $url (attempt $i/30)"; sleep 20
+            done
+            echo "::error::$url did not become healthy"; return 1
+          }
+          check "$GATEWAY_URL/health"
+          check "$GATEWAY_URL/health/services"   # gateway + auth + transactions + notifications
+          if [ -n "$FRONTEND_URL" ]; then check "${FRONTEND_URL%/}"; fi
